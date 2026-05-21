@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.env
+REVIEW_REPORT.md
+REVIEW_REPORT.html
+.reviewer-cache/

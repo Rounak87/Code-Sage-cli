@@ -1,0 +1,22 @@
+{
+  "name": "gemini-code-reviewer",
+  "version": "1.0.0",
+  "description": "Pragmatic, Gemini-powered AI Code Reviewer CLI with tool-calling capabilities",
+  "main": "src/cli.ts",
+  "type": "module",
+  "scripts": {
+    "review": "tsx src/cli.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^1.1.9",
+    "ai": "^4.1.28",
+    "dotenv": "^16.4.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "tsx": "^4.7.2",
+    "typescript": "^5.4.5"
+  }
+}
