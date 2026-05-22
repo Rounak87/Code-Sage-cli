@@ -1,14 +1,74 @@
 import { generateText, generateObject, tool } from 'ai';
-import { google } from '@ai-sdk/google';
+import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getGitDiff, getFileContent, getGitRoot, ChangedFile } from './git.js';
 import { fetchFileContent, searchCodebase, listDirectory } from './tools.js';
 
-// Load model from environment variables
-const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
-const googleProvider = google(modelName);
+// Initialize custom Google Generative AI provider using the configured api key
+const googleInstance = createGoogleGenerativeAI({
+  apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_GENERATIVE_AI_API_KEY
+});
+
+/**
+ * Utility to execute LLM API calls with retry logic on 429 Rate Limit / Quota errors.
+ */
+async function callWithRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 10000): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      attempt++;
+      const errorMessage = (error && typeof error === 'object' && error.message) ? String(error.message) : '';
+      const status = error && typeof error === 'object' ? (error.status || error.statusCode) : undefined;
+      const isRateLimit = status === 429 || 
+                          errorMessage.includes('429') || 
+                          errorMessage.toLowerCase().includes('quota') ||
+                          errorMessage.toLowerCase().includes('rate limit');
+      
+      if (isRateLimit && attempt <= retries) {
+        let waitTime = delayMs;
+        const match = errorMessage.match(/retry in (\d+(?:\.\d+)?)s/i);
+        if (match) {
+          waitTime = Math.ceil(parseFloat(match[1]) * 1000) + 3000; // Add 3 seconds safety buffer
+        }
+        console.warn(`\n⚠️ Rate limit or quota hit. Waiting ${(waitTime / 1000).toFixed(1)} seconds before retry attempt ${attempt}/${retries}...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+/**
+ * Executes a generateObject call using the primary model. If that fails after retries,
+ * it falls back to the backup model.
+ */
+async function generateObjectWithFallback(
+  options: any
+): Promise<any> {
+  const primaryModelName = process.env.GEMINI_PRIMARY_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const backupModelName = process.env.GEMINI_BACKUP_MODEL || 'gemini-2.5-flash-lite';
+  
+  const primaryProvider = googleInstance(primaryModelName);
+  const backupProvider = googleInstance(backupModelName);
+
+  try {
+    return await callWithRetry(() => generateObject({
+      ...options,
+      model: primaryProvider
+    }));
+  } catch (primaryError: any) {
+    console.warn(`\n⚠️ Primary model (${primaryModelName}) failed: ${primaryError.message}. Falling back to backup model (${backupModelName})...`);
+    return await callWithRetry(() => generateObject({
+      ...options,
+      model: backupProvider
+    }));
+  }
+}
 
 export interface ReviewComment {
   filePath: string;
@@ -101,8 +161,8 @@ Provide a plan containing:
 1. Overall review goals.
 2. A list of file scopes mapping each file path to its skip status, focus areas, and reason.`;
 
-  const response = await generateObject({
-    model: googleProvider,
+  const response = await generateObjectWithFallback({
+    maxRetries: 0,
     schema: z.object({
       overallGoals: z.string().describe('The primary engineering focus for this review run.'),
       files: z.array(z.object({
@@ -117,7 +177,7 @@ Provide a plan containing:
   });
 
   const fileScopes: Record<string, { skip: boolean; focus: string[]; reason: string }> = {};
-  response.object.files.forEach(f => {
+  response.object.files.forEach((f: any) => {
     fileScopes[f.path] = { skip: f.skip, focus: f.focus, reason: f.reason };
   });
 
@@ -170,8 +230,8 @@ ${file.diff}
 Review the diff. Output a JSON object containing comments. Verify that each comment's "line" property matches one of the line numbers in the added lines of the diff.`;
 
   try {
-    const response = await generateObject({
-      model: googleProvider,
+    const response = await generateObjectWithFallback({
+      maxRetries: 0,
       schema: z.object({
         comments: z.array(z.object({
           line: z.number().describe('The line number in the modified file where the issue occurs.'),
@@ -189,7 +249,7 @@ Review the diff. Output a JSON object containing comments. Verify that each comm
     });
 
     // Map response to ReviewComment interface
-    return response.object.comments.map(c => ({
+    return response.object.comments.map((c: any) => ({
       filePath: file.path,
       line: c.line,
       severity: c.severity,
@@ -208,25 +268,99 @@ Review the diff. Output a JSON object containing comments. Verify that each comm
 }
 
 /**
- * Stage 4: Run the Cross-File Agent using Gemini Tool calling loop.
+ * Utility to recursively read relevant files in the workspace asynchronously.
+ */
+async function gatherCodebaseContext(root: string): Promise<string> {
+  let context = '';
+  const visited = new Set<string>();
+  let limitReached = false;
+  
+  const MAX_FILE_SIZE_BYTES = 50000; // 50KB limit
+  const MAX_TOTAL_CONTEXT_BYTES = 500000; // 500KB limit
+
+  async function scan(dir: string): Promise<void> {
+    if (limitReached) return;
+    
+    let items: string[];
+    try {
+      items = await fs.promises.readdir(dir);
+    } catch (error: any) {
+      console.warn(`⚠️ Skipped reading directory ${dir}: ${error.message}`);
+      return;
+    }
+
+    for (const item of items) {
+      if (limitReached) break;
+      
+      const fullPath = path.join(dir, item);
+      const relativePath = path.relative(root, fullPath).replace(/\\/g, '/');
+      
+      // Exclude list
+      if (
+        item.startsWith('.') ||
+        item === 'node_modules' ||
+        item === 'dist' ||
+        item === 'package-lock.json' ||
+        item.endsWith('.png') ||
+        item.endsWith('.jpg') ||
+        item.endsWith('.ico') ||
+        relativePath === 'REVIEW_REPORT.md' ||
+        relativePath === 'REVIEW_REPORT.html' ||
+        relativePath === 'PROJECT_PLAN.md' ||
+        relativePath === 'ARCHITECTURE.md'
+      ) {
+        continue;
+      }
+      
+      try {
+        const stat = await fs.promises.lstat(fullPath);
+        if (stat.isSymbolicLink()) {
+          const realPath = await fs.promises.realpath(fullPath);
+          if (visited.has(realPath)) continue;
+          visited.add(realPath);
+        }
+        if (stat.isDirectory()) {
+          await scan(fullPath);
+        } else if (stat.isFile() && stat.size < MAX_FILE_SIZE_BYTES) {
+          if (context.length > MAX_TOTAL_CONTEXT_BYTES) {
+            console.warn('⚠️ Codebase context limit reached. Skipping remaining files.');
+            limitReached = true;
+            break;
+          }
+          const content = await fs.promises.readFile(fullPath, 'utf-8');
+          context += `\n--- File: ${relativePath} ---\n${content}\n`;
+        }
+      } catch (error: any) {
+        console.warn(`⚠️ Skipped file/symlink ${relativePath}: ${error.message}`);
+      }
+    }
+  }
+  
+  await scan(root);
+  return context;
+}
+
+/**
+ * Stage 4: Run the Cross-File Reasoner Agent (static context analysis).
  */
 async function runCrossFileAgent(state: ReviewState): Promise<ReviewComment[]> {
-  const crossFileComments: ReviewComment[] = [];
-
-  const systemPrompt = `You are a Systems Architect reviewing a changeset. You have a list of file review reports.
-Your goal is to investigate cross-file discrepancies and dependencies.
+  const systemPrompt = `You are a Systems Architect reviewing a changeset.
+Your goal is to inspect the codebase context and identify any cross-file inconsistencies or secondary defects caused by the modifications.
 Examples of what to look for:
 - Did a DB schema/model change? Check if queries or migrations in other files match.
 - Did an exported function signature change? Check if other consumers are calling it with correct arguments.
 - Was a new config/env variable introduced? Check if the template files (.env.example) were updated.
 
-Use your tools (\`fetchFileContent\`, \`searchCodebase\`, \`listDirectory\`) to inspect files in the codebase that were NOT changed in the diff.
-If you find a genuine discrepancy, report it using the \`reportFinding\` tool.
-Only report high-confidence discrepancies. Explain why they are broken and the consequences.`;
+Provide a list of high-confidence discrepancies found in files that were NOT changed in the diff. Explain why they are broken and the consequences.`;
+
+  const codebaseContext = await gatherCodebaseContext(state.repoRoot);
 
   const userPrompt = `Project Context:
 - Languages: ${state.languages.join(', ')}
 - Core Dependencies: ${state.dependencies.join(', ')}
+
+Codebase Content (All relevant files):
+${codebaseContext}
 
 Changed Files in this commit:
 ${state.changedFiles.map(f => f.path).join(', ')}
@@ -234,38 +368,13 @@ ${state.changedFiles.map(f => f.path).join(', ')}
 Review comments found so far in modified files:
 ${JSON.stringify(state.comments, null, 2)}
 
-Investigate the codebase for any secondary effects or inconsistencies caused by these changes. Call tools to search or read files as needed. When you find an issue, use the \`reportFinding\` tool to record it.`;
+Analyze the codebase content above and identify any secondary effects or inconsistencies caused by these changes in unmodified files. Output a JSON list of findings. Only report high-confidence issues.`;
 
-  await generateText({
-    model: googleProvider,
-    maxSteps: 8, // Set a safe max loop count
-    system: systemPrompt,
-    prompt: userPrompt,
-    tools: {
-      fetchFileContent: tool({
-        description: 'Read the contents of a file in the workspace.',
-        parameters: z.object({ path: z.string().describe('File path relative to the repository root.') }),
-        execute: async ({ path: filePath }) => {
-          return fetchFileContent(filePath, state.repoRoot);
-        }
-      }),
-      searchCodebase: tool({
-        description: 'Search the codebase for a text query (grep).',
-        parameters: z.object({ query: z.string().describe('Text query or function name to search for.') }),
-        execute: async ({ query }) => {
-          return searchCodebase(query, state.repoRoot);
-        }
-      }),
-      listDirectory: tool({
-        description: 'List items in a workspace folder.',
-        parameters: z.object({ path: z.string().describe('Directory path relative to the repository root.') }),
-        execute: async ({ path: dirPath }) => {
-          return listDirectory(dirPath, state.repoRoot);
-        }
-      }),
-      reportFinding: tool({
-        description: 'Report a cross-file discrepancy or security/logical bug discovered in your investigation.',
-        parameters: z.object({
+  try {
+    const response = await generateObjectWithFallback({
+      maxRetries: 0,
+      schema: z.object({
+        findings: z.array(z.object({
           filePath: z.string().describe('The file path containing the broken or inconsistent code.'),
           line: z.number().describe('Approximate line number where the inconsistency resides.'),
           severity: z.enum(['LOW', 'MEDIUM', 'HIGH']),
@@ -275,19 +384,20 @@ Investigate the codebase for any secondary effects or inconsistencies caused by 
           whyItMatters: z.string().describe('Educational explanation of the core concept.'),
           consequences: z.string().describe('What will fail in production if this inconsistency is merged.'),
           suggestedPatch: z.string().optional().describe('Code suggestion to resolve the issue.')
-        }),
-        execute: async (finding) => {
-          crossFileComments.push({
-            ...finding,
-            confidence: 0.85
-          });
-          return `Finding successfully recorded in file: ${finding.filePath}`;
-        }
-      })
-    }
-  });
+        }))
+      }),
+      system: systemPrompt,
+      prompt: userPrompt
+    });
 
-  return crossFileComments;
+    return response.object.findings.map((f: any) => ({
+      ...f,
+      confidence: 0.85
+    }));
+  } catch (error: any) {
+    console.error("Failed to run cross-file reasoner:", error.message);
+    return [];
+  }
 }
 
 /**
@@ -313,19 +423,40 @@ export async function runReviewPipeline(
     return state;
   }
 
+  const sleepWithCountdown = async (seconds: number, actionDescription: string) => {
+    for (let i = seconds; i > 0; i--) {
+      process.stdout.write(`\r⏳ ${actionDescription}... (${i}s remaining)   `);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    process.stdout.write(`\r✅ ${actionDescription}... Done!                             \n`);
+  };
+
   // 1. Run Planner
+  console.log(`📋 Running planner stage...`);
   const plan = await runPlanner(state);
   state.plannerGoals = plan.overallGoals;
 
-  // 2. Run File Reviewers in Parallel
-  const fileReviews = await Promise.all(
-    changedFiles.map(file => runFileReview(file, plan.fileScopes[file.path] || { skip: false, focus: [], reason: '' }, state))
-  );
+  // 2. Run File Reviewers Sequentially with delays to respect the 5 RPM rate limit
+  const fileReviews: ReviewComment[][] = [];
+  for (let idx = 0; idx < changedFiles.length; idx++) {
+    const file = changedFiles[idx];
+    const scope = plan.fileScopes[file.path] || { skip: false, focus: [], reason: '' };
+    if (!scope.skip) {
+      await sleepWithCountdown(12, `Rate limit pause before reviewing ${file.path} (${idx + 1}/${changedFiles.length})`);
+      console.log(`🔍 Reviewing ${file.path}...`);
+      const review = await runFileReview(file, scope, state);
+      fileReviews.push(review);
+    } else {
+      console.log(`⏭️ Skipping ${file.path} as per review plan.`);
+    }
+  }
 
   // Flatten comments from all files
   state.comments = fileReviews.flat();
 
   // 3. Run Cross-File Reasoner Agent
+  await sleepWithCountdown(12, `Rate limit pause before running cross-file agent`);
+  console.log(`🧠 Running cross-file dependency agent...`);
   const crossFileComments = await runCrossFileAgent(state);
   state.comments.push(...crossFileComments);
 

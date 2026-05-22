@@ -4,7 +4,7 @@ import 'dotenv/config';
 import * as fs from 'fs';
 import * as path from 'path';
 import { runReviewPipeline } from './orchestrator.js';
-import { reportToConsole, writeMarkdownReport } from './reporter.js';
+import { reportToConsole, writeMarkdownReport, writeHtmlReport } from './reporter.js';
 
 // Console coloring codes
 const RESET = '\x1b[0m';
@@ -44,7 +44,9 @@ async function main() {
   }
 
   console.log(`🔍 Review mode: ${BOLD}${mode.toUpperCase()}${RESET} changes`);
-  console.log(`📡 Connected model: ${BOLD}${process.env.GEMINI_MODEL || 'gemini-1.5-flash'}${RESET}`);
+  const primaryModel = process.env.GEMINI_PRIMARY_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const backupModel = process.env.GEMINI_BACKUP_MODEL || 'gemini-2.5-flash-lite';
+  console.log(`📡 Connected model: ${BOLD}${primaryModel}${RESET} (Backup: ${backupModel})`);
   console.log(`⏳ Initializing pipeline, parsing git diff...`);
 
   try {
@@ -64,6 +66,7 @@ async function main() {
     
     // Write reports
     writeMarkdownReport(state);
+    writeHtmlReport(state);
     reportToConsole(state);
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);

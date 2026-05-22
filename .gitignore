@@ -4,3 +4,7 @@ dist/
 REVIEW_REPORT.md
 REVIEW_REPORT.html
 .reviewer-cache/
+PROJECT_PLAN.md
+.env.example
+ARCHITECTURE.md
+test_buggy_file.ts
