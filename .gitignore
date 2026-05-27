@@ -8,3 +8,6 @@ PROJECT_PLAN.md
 .env.example
 ARCHITECTURE.md
 test_buggy_file.ts
+PROJECT_PLAN.md
+ARCHITECTURE.md
+plan.py
