@@ -3,8 +3,16 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
+import ts from 'typescript';
 import { getGitDiff, getFileContent, getGitRoot, ChangedFile } from './git.js';
 import { fetchFileContent, searchCodebase, listDirectory } from './tools.js';
+
+interface ASTAnalysis {
+  exports: string[];
+  imports: { [importedSymbol: string]: string }; // maps symbol -> module specifier (e.g. "getUser" -> "./db.js")
+  calls: string[];
+}
+
 
 // Initialize custom Google Generative AI provider using the configured api key
 const googleInstance = createGoogleGenerativeAI({
@@ -267,20 +275,89 @@ Review the diff. Output a JSON object containing comments. Verify that each comm
   }
 }
 
-/**
- * Utility to recursively read relevant files in the workspace asynchronously.
- */
-async function gatherCodebaseContext(root: string): Promise<string> {
-  let context = '';
+interface FileGraphNode {
+  filePath: string;
+  exports: string[];
+  imports: { [symbol: string]: string };
+  calls: string[];
+}
+
+export interface CallGraph {
+  [filePath: string]: FileGraphNode;
+}
+
+function analyzeFileAST(filePath: string, content: string): ASTAnalysis {
+  const exports: string[] = [];
+  const imports: { [importedSymbol: string]: string } = {};
+  const calls: string[] = [];
+
+  const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
+
+  function visit(node: ts.Node) {
+    // 1. Exports
+    if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)) {
+      const hasExport = node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword);
+      if (hasExport && node.name) {
+        exports.push(node.name.text);
+      }
+    } else if (ts.isVariableStatement(node)) {
+      const hasExport = node.modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword);
+      if (hasExport) {
+        for (const decl of node.declarationList.declarations) {
+          if (ts.isIdentifier(decl.name)) {
+            exports.push(decl.name.text);
+          }
+        }
+      }
+    } else if (ts.isExportDeclaration(node)) {
+      if (node.exportClause && ts.isNamedExports(node.exportClause)) {
+        for (const el of node.exportClause.elements) {
+          exports.push(el.name.text);
+        }
+      }
+    }
+
+    // 2. Imports
+    if (ts.isImportDeclaration(node)) {
+      const moduleSpecifier = ts.isStringLiteral(node.moduleSpecifier) ? node.moduleSpecifier.text : '';
+      if (moduleSpecifier && node.importClause) {
+        if (node.importClause.name) {
+          imports[node.importClause.name.text] = moduleSpecifier;
+        }
+        if (node.importClause.namedBindings) {
+          if (ts.isNamedImports(node.importClause.namedBindings)) {
+            for (const el of node.importClause.namedBindings.elements) {
+              imports[el.name.text] = moduleSpecifier;
+            }
+          } else if (ts.isNamespaceImport(node.importClause.namedBindings)) {
+            imports[node.importClause.namedBindings.name.text] = moduleSpecifier;
+          }
+        }
+      }
+    }
+
+    // 3. Calls
+    if (ts.isCallExpression(node)) {
+      if (ts.isIdentifier(node.expression)) {
+        calls.push(node.expression.text);
+      } else if (ts.isPropertyAccessExpression(node.expression)) {
+        calls.push(node.expression.name.text);
+      }
+    }
+
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+
+  return { exports, imports, calls };
+}
+
+async function buildCallGraph(root: string): Promise<CallGraph> {
+  const graph: CallGraph = {};
   const visited = new Set<string>();
-  let limitReached = false;
-  
-  const MAX_FILE_SIZE_BYTES = 50000; // 50KB limit
-  const MAX_TOTAL_CONTEXT_BYTES = 500000; // 500KB limit
 
   async function scan(dir: string): Promise<void> {
-    if (limitReached) return;
-    
     let items: string[];
     try {
       items = await fs.promises.readdir(dir);
@@ -290,28 +367,21 @@ async function gatherCodebaseContext(root: string): Promise<string> {
     }
 
     for (const item of items) {
-      if (limitReached) break;
-      
       const fullPath = path.join(dir, item);
       const relativePath = path.relative(root, fullPath).replace(/\\/g, '/');
-      
+
       // Exclude list
       if (
         item.startsWith('.') ||
         item === 'node_modules' ||
         item === 'dist' ||
         item === 'package-lock.json' ||
-        item.endsWith('.png') ||
-        item.endsWith('.jpg') ||
-        item.endsWith('.ico') ||
-        relativePath === 'REVIEW_REPORT.md' ||
-        relativePath === 'REVIEW_REPORT.html' ||
         relativePath === 'PROJECT_PLAN.md' ||
         relativePath === 'ARCHITECTURE.md'
       ) {
         continue;
       }
-      
+
       try {
         const stat = await fs.promises.lstat(fullPath);
         if (stat.isSymbolicLink()) {
@@ -321,24 +391,88 @@ async function gatherCodebaseContext(root: string): Promise<string> {
         }
         if (stat.isDirectory()) {
           await scan(fullPath);
-        } else if (stat.isFile() && stat.size < MAX_FILE_SIZE_BYTES) {
-          if (context.length > MAX_TOTAL_CONTEXT_BYTES) {
-            console.warn('⚠️ Codebase context limit reached. Skipping remaining files.');
-            limitReached = true;
-            break;
-          }
+        } else if (stat.isFile() && item.match(/\.(ts|js|tsx|jsx)$/)) {
           const content = await fs.promises.readFile(fullPath, 'utf-8');
-          context += `\n--- File: ${relativePath} ---\n${content}\n`;
+          const analysis = analyzeFileAST(relativePath, content);
+          graph[relativePath] = {
+            filePath: relativePath,
+            ...analysis
+          };
         }
       } catch (error: any) {
         console.warn(`⚠️ Skipped file/symlink ${relativePath}: ${error.message}`);
       }
     }
   }
-  
+
   await scan(root);
-  return context;
+  return graph;
 }
+
+function matchesImport(specifier: string, importerPath: string, targetPath: string): boolean {
+  try {
+    const importerDir = path.dirname(importerPath);
+    const resolvedSpecifier = path.resolve(importerDir, specifier).replace(/\\/g, '/');
+    const resolvedTarget = path.resolve(targetPath).replace(/\\/g, '/');
+    const stripExt = (p: string) => p.replace(/\.[a-zA-Z0-9]+$/, '');
+    return stripExt(resolvedSpecifier) === stripExt(resolvedTarget);
+  } catch {
+    return false;
+  }
+}
+
+function getModifiedExports(changedFile: ChangedFile, exports: string[]): string[] {
+  const modified: string[] = [];
+  const diffLines = changedFile.diff.split('\n');
+  
+  for (const exp of exports) {
+    const regex = new RegExp(`^[+-].*\\b${exp}\\b`);
+    const isMod = diffLines.some(line => regex.test(line));
+    if (isMod) {
+      modified.push(exp);
+    }
+  }
+  return modified;
+}
+
+interface CallerContext {
+  filePath: string;
+  line: number;
+  context: string;
+}
+
+async function getCallerContexts(
+  importerPath: string,
+  symbol: string,
+  root: string
+): Promise<CallerContext[]> {
+  const fullPath = path.join(root, importerPath);
+  let content: string;
+  try {
+    content = await fs.promises.readFile(fullPath, 'utf-8');
+  } catch {
+    return [];
+  }
+  const lines = content.split('\n');
+  const contexts: CallerContext[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const regex = new RegExp(`\\b${symbol}\\b`);
+    if (regex.test(line)) {
+      const start = Math.max(0, i - 4);
+      const end = Math.min(lines.length - 1, i + 5);
+      const snippet = lines.slice(start, end + 1).map((l, idx) => `${start + idx + 1}: ${l}`).join('\n');
+      contexts.push({
+        filePath: importerPath,
+        line: i + 1,
+        context: snippet
+      });
+    }
+  }
+  return contexts;
+}
+
 
 /**
  * Stage 4: Run the Cross-File Reasoner Agent (static context analysis).
@@ -347,28 +481,56 @@ async function runCrossFileAgent(state: ReviewState): Promise<ReviewComment[]> {
   const systemPrompt = `You are a Systems Architect reviewing a changeset.
 Your goal is to inspect the codebase context and identify any cross-file inconsistencies or secondary defects caused by the modifications.
 Examples of what to look for:
-- Did a DB schema/model change? Check if queries or migrations in other files match.
-- Did an exported function signature change? Check if other consumers are calling it with correct arguments.
-- Was a new config/env variable introduced? Check if the template files (.env.example) were updated.
+- Did an exported function signature or class type change? Check if other consumers in other files are calling it with correct arguments.
+- Check if the caller code is now broken, misaligned, or needs modifications due to the changes.
 
-Provide a list of high-confidence discrepancies found in files that were NOT changed in the diff. Explain why they are broken and the consequences.`;
+Provide a list of high-confidence discrepancies found in caller files that were NOT changed in the diff. Explain why they are broken and the consequences.`;
 
-  const codebaseContext = await gatherCodebaseContext(state.repoRoot);
+  console.log("📊 Building AST call graph of the codebase...");
+  const graph = await buildCallGraph(state.repoRoot);
+  
+  const callerContexts: { symbol: string; filePath: string; line: number; context: string }[] = [];
+  
+  for (const file of state.changedFiles) {
+    const fileNode = graph[file.path];
+    if (!fileNode) continue;
+    
+    const modifiedExports = getModifiedExports(file, fileNode.exports);
+    for (const exp of modifiedExports) {
+      for (const [importerPath, importerNode] of Object.entries(graph)) {
+        if (importerPath === file.path) continue;
+        
+        const specifier = importerNode.imports[exp];
+        if (specifier && matchesImport(specifier, importerPath, file.path)) {
+          const contexts = await getCallerContexts(importerPath, exp, state.repoRoot);
+          callerContexts.push(...contexts.map(c => ({ symbol: exp, ...c })));
+        }
+      }
+    }
+  }
+
+  if (callerContexts.length === 0) {
+    console.log("✨ No unmodified files are affected by the exported changes. Skipping cross-file agent call.");
+    return [];
+  }
+
+  console.log(`🔍 Found ${callerContexts.length} caller location(s) in unmodified files. Reviewing for compatibility...`);
+
+  const formattedCallerContexts = callerContexts.map(c => 
+    `--- Caller File: ${c.filePath} (Line ${c.line}) calling symbol: ${c.symbol} ---\n${c.context}`
+  ).join('\n\n');
 
   const userPrompt = `Project Context:
 - Languages: ${state.languages.join(', ')}
 - Core Dependencies: ${state.dependencies.join(', ')}
 
-Codebase Content (All relevant files):
-${codebaseContext}
-
 Changed Files in this commit:
-${state.changedFiles.map(f => f.path).join(', ')}
+${state.changedFiles.map(f => `File: ${f.path}\nDiff:\n${f.diff}`).join('\n\n')}
 
-Review comments found so far in modified files:
-${JSON.stringify(state.comments, null, 2)}
+Downstream Caller Locations in Unmodified Files (Snippet with line numbers):
+${formattedCallerContexts}
 
-Analyze the codebase content above and identify any secondary effects or inconsistencies caused by these changes in unmodified files. Output a JSON list of findings. Only report high-confidence issues.`;
+Analyze the changes and verify if they break any of the caller locations in unmodified files. If a caller location is incompatible, report a finding for it. Output a JSON list of findings. Only report high-confidence integration issues.`;
 
   try {
     const response = await generateObjectWithFallback({
@@ -399,6 +561,7 @@ Analyze the codebase content above and identify any secondary effects or inconsi
     return [];
   }
 }
+
 
 /**
  * Main Orchestrator Execution Pipeline.

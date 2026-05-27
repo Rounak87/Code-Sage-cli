@@ -1,8 +1,14 @@
 {
-  "name": "gemini-code-reviewer",
-  "version": "1.0.0",
-  "description": "Pragmatic, Gemini-powered AI Code Reviewer CLI with tool-calling capabilities",
-  "main": "src/cli.ts",
+  "name": "code-sage-cli",
+  "version": "1.1.1",
+  "description": "Pragmatic, Gemini-powered AST Call-Graph AI Code Reviewer CLI",
+  "main": "./dist/cli.js",
+  "bin": {
+    "code-sage": "./dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
   "type": "module",
   "scripts": {
     "review": "tsx src/cli.ts",
@@ -10,13 +16,14 @@
   },
   "dependencies": {
     "@ai-sdk/google": "^1.1.9",
+    "@octokit/rest": "^20.1.1",
     "ai": "^4.1.28",
     "dotenv": "^16.4.5",
+    "typescript": "^5.4.5",
     "zod": "^3.23.8"
   },
   "devDependencies": {
     "@types/node": "^20.12.7",
-    "tsx": "^4.7.2",
-    "typescript": "^5.4.5"
+    "tsx": "^4.7.2"
   }
 }
