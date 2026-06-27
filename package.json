@@ -1,6 +1,6 @@
 {
   "name": "code-sage-cli",
-  "version": "1.1.1",
+  "version": "1.3.1",
   "description": "Pragmatic, Gemini-powered AST Call-Graph AI Code Reviewer CLI",
   "main": "./dist/cli.js",
   "bin": {
@@ -16,9 +16,13 @@
   },
   "dependencies": {
     "@ai-sdk/google": "^1.1.9",
+    "@langchain/core": "^1.2.1",
+    "@langchain/langgraph": "^1.4.7",
     "@octokit/rest": "^20.1.1",
     "ai": "^4.1.28",
+    "chalk": "^5.6.2",
     "dotenv": "^16.4.5",
+    "ora": "^9.4.1",
     "typescript": "^5.4.5",
     "zod": "^3.23.8"
   },

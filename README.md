@@ -1,129 +1,153 @@
 # Code-Sage CLI
-An automated GitHub Pull Request code reviewer powered by Gemini and local AST dependency analysis.
 
-Code-Sage is designed to run natively in your CI/CD pipeline, automatically posting precise, inline code reviews and engineering suggestions directly onto your Pull Request diffs. 
-
-Unlike conventional AI code reviewers that analyze files in isolation, Code-Sage builds an Abstract Syntax Tree (AST) call-graph of your project to trace the downstream "blast radius" of signature changes. This ensures that if you change an export signature, Code-Sage locates and reviews unmodified files that call it—catching integration bugs before they merge.
+An agentic AI code reviewer built on a **LangGraph state machine** and a local **AST call-graph engine**.  
+Runs in GitHub Actions to post inline reviews directly onto Pull Request diffs.
 
 ---
 
-## Architecture & Core Features
+## Architecture
 
-### 🚀 Automated GitHub PR Reviews (Primary Focus)
-* **Inline Line-Level Reviews**: Publishes reviews directly onto the specific files and lines modified or affected.
-* **Intelligent Diff Matching**: Leverages `@octokit/rest` to map comments directly to PR diff coordinate regions.
-* **Unified Review Fallbacks**: Automatically falls back to posting a structured, high-level summary review if coordinate drifts occur.
+Code-Sage is implemented as a LangGraph `StateGraph` — a directed agentic execution graph where each node is an isolated stage that reads from and writes to shared typed state. The graph routes conditionally at runtime based on what it discovers.
 
-### 🧠 AST Call-Graph Blast Radius Analysis
-* **Module Dependency Mapping**: Extracts function declarations, class structures, imports, and caller-site nodes locally.
-* **Contextual Prompting**: Feeds Gemini only the changed diff and the 10-line context surrounding unmodified calling locations.
-* **Token Efficiency**: Prevents context window overload by bypassing bloated, repository-wide file loading.
+```mermaid
+flowchart TD
+    A([START]) --> B[load_context\nRead git diff · detect languages]
+    B -->|no changed files| Z([END])
+    B --> C[planner\nGemini builds per-file review strategy]
+    C --> D[file_reviewer\nReview each file · comments merged via state reducer]
+    D --> E[build_ast\nLocal TypeScript AST call graph\nNo LLM · finds downstream callers]
+    E -->|no callers affected| Z
+    E --> F[cross_file_analyzer\nGemini checks caller compatibility]
+    F --> Z
+
+    style A fill:#111,color:#fff,stroke:#333
+    style Z fill:#111,color:#fff,stroke:#333
+    style B fill:#1a1a1a,color:#eee,stroke:#444
+    style C fill:#1a1a1a,color:#eee,stroke:#444
+    style D fill:#1a1a1a,color:#eee,stroke:#444
+    style E fill:#1a1a1a,color:#eee,stroke:#444
+    style F fill:#1a1a1a,color:#eee,stroke:#444
+```
+
+**What makes this architecture meaningful:**
+
+- **Conditional edges**: The cross-file LLM call only fires if the AST graph finds unmodified callers affected by the change. Empty diffs exit at the first edge. No wasted API calls.
+- **State reducer on comments**: Each node appends review findings to shared state independently. `file_reviewer` and `cross_file_analyzer` never overwrite each other.
+- **Node isolation**: Each node can fail and retry independently. A failed file review does not abort the cross-file analysis stage.
+- **AST runs local**: The call graph is built entirely on-device. The LLM only ever sees the git diff and the 10-line snippets surrounding affected caller sites — no full codebase uploads.
 
 ---
 
-## ⚡ Quick Start: 3-Minute GitHub Actions Setup
+## Tech Stack
 
-To enable automated reviews on every Pull Request:
+| Layer | Technology |
+| :--- | :--- |
+| Agentic Graph | LangGraph `@langchain/langgraph` |
+| LLM | Google Gemini via Vercel AI SDK `@ai-sdk/google` |
+| AST Parsing | TypeScript Compiler API |
+| GitHub Integration | Octokit REST `@octokit/rest` |
+| CLI | ora · chalk |
+| Schema Validation | Zod |
 
-### Step 1: Add your Gemini API Key to GitHub Secrets
-1. Navigate to your GitHub repository **Settings** ➔ **Secrets and variables** ➔ **Actions**.
-2. Click **New repository secret**.
-3. Create a secret named `GEMINI_API_KEY` and paste your API key (get one from [Google AI Studio](https://aistudio.google.com/)).
+---
 
-### Step 2: Auto-Generate the Workflow File
-In the root directory of your project, run:
+## Usage
 
+### Option A — Run Locally
+
+Review uncommitted changes before pushing. No GitHub required.
+
+**1. Get a free API key** from [Google AI Studio](https://aistudio.google.com/)
+
+**2. Set the key:**
+```bash
+# macOS / Linux
+export GEMINI_API_KEY="your_key_here"
+
+# Windows PowerShell
+$env:GEMINI_API_KEY="your_key_here"
+```
+Or place `GEMINI_API_KEY=your_key_here` in a `.env` file at the project root.
+
+**3. Run:**
+```bash
+# All uncommitted changes
+npx code-sage-cli
+
+# Staged only
+npx code-sage-cli --staged
+
+# Unstaged only
+npx code-sage-cli --unstaged
+```
+
+Findings are printed directly to the terminal — severity level, file, line, problem, consequences, and suggested patch where applicable.
+
+---
+
+### Option B — GitHub Actions (Automated PR Reviews)
+
+Code-Sage posts inline review comments directly onto the Pull Request diff. No configuration file to write manually.
+
+**1. Add your API key to GitHub Secrets**
+
+Go to your repository → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**
+
+- Name: `GEMINI_API_KEY`
+- Value: your Gemini API key
+
+**2. Auto-generate the workflow file**
+
+In the root of your repository, run:
 ```bash
 npx code-sage-cli --init
 ```
 
-This automatically creates `.github/workflows/code-review.yml` with the correct permissions and runner commands:
+This creates `.github/workflows/code-review.yml` with correct permissions and runner config.
 
-```yaml
-name: Code-Sage Reviewer
-
-on:
-  pull_request:
-    types: [opened, synchronize]
-
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write # Required to post inline reviews
-      contents: read       # Required to checkout code
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Required to calculate git diffs between commits
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Run Code-Sage
-        run: npx code-sage-cli --staged
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Provided automatically by GitHub Actions
-```
-
-### Step 3: Commit and Push
-Commit and push the generated workflow file:
+**3. Commit and push**
 ```bash
 git add .github/workflows/code-review.yml
-git commit -m "ci: integrate code-sage-cli PR review workflow"
-git push origin main
+git commit -m "ci: add code-sage automated PR review"
+git push
 ```
+
+Every Pull Request opened or updated from this point will automatically trigger Code-Sage. It will run the full agentic pipeline against the PR diff and post findings as inline comments on the changed lines.
 
 ---
 
-## Local Usage
+## CLI Reference
 
-You can also run Code-Sage locally to review uncommitted code changes before staging or committing:
+| Flag | Description |
+| :--- | :--- |
+| *(none)* | Review all uncommitted changes |
+| `--staged` | Review staged changes only |
+| `--unstaged` | Review unstaged changes only |
+| `--init` | Generate the GitHub Actions workflow file |
+| `--force` | Bypass the large-file and initial-commit guards |
 
-### 1. Set environment variable
-* **macOS/Linux**: `export GEMINI_API_KEY="your_api_key_here"`
-* **Windows (PowerShell)**: `$env:GEMINI_API_KEY="your_api_key_here"`
+| Environment Variable | Description |
+| :--- | :--- |
+| `GEMINI_API_KEY` | Required. Google Gemini API key. |
+| `GITHUB_TOKEN` | Required in CI. Provided automatically by GitHub Actions. |
+| `GEMINI_PRIMARY_MODEL` | Optional. Override the primary model. Default: `gemini-2.5-flash` |
+| `GEMINI_BACKUP_MODEL` | Optional. Override the fallback model. Default: `gemini-2.5-flash-lite` |
 
-### 2. Execute
+---
+
+## Contributing
+
 ```bash
-# Review all local modifications (staged + unstaged)
-npx code-sage-cli
-
-# Review staged changes only
-npx code-sage-cli --staged
-
-# Review unstaged changes only
-npx code-sage-cli --unstaged
+git clone https://github.com/Rounak87/Code-Sage-cli.git
+cd Code-Sage-cli
+npm install
+npm run build
+npm link
+code-sage-cli --staged
 ```
-
----
-
-## Contributing & Local Development
-
-If you want to customize the review prompts, heuristics, or extend AST parsing support:
-
-1. Clone the repository and install dependencies:
-   ```bash
-   npm install
-   ```
-2. Compile the TypeScript compiler output:
-   ```bash
-   npm run build
-   ```
-3. Link the package locally:
-   ```bash
-   npm link
-   ```
-4. Run locally from source:
-   ```bash
-   code-sage-cli
-   ```
 
 ---
 
 ## License
-MIT License.
+
+MIT
